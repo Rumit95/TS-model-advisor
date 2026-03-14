@@ -39,8 +39,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-# statsmodels provides the ACF / PACF computation
-from statsmodels.tsa.stattools import acf, pacf
+# statsmodels provides the ACF / PACF computation and stationarity test
+from statsmodels.tsa.stattools import acf, pacf, adfuller
 
 # ─── App-wide constants ────────────────────────────────────────────────────
 # Colours
@@ -58,9 +58,10 @@ CARD_BORDER     = "#3d3d56"        # subtle border colour
 MODEL_NAMES = ["AR", "MA", "ARMA", "ARIMA", "SARIMA"]
 
 # ─── Reason / trait flags we track ─────────────────────────────────────────
-# Each "reason" is a trait detected in the data.  The radio button next to it
+# Each "reason" is a trait detected in the data.  The indicator next to it
 # highlights when the trait is detected.
 REASON_KEYS = [
+    "stationarity",    # ADF test says non-stationary (p > 0.05)
     "trend",           # data has an upward / downward trend
     "seasonality",     # repeating seasonal pattern exists
     "pacf_cutoff",     # PACF cuts off sharply  → AR signature
@@ -69,11 +70,21 @@ REASON_KEYS = [
 ]
 
 REASON_LABELS = {
+    "stationarity": "ADF test: series is non-stationary (p > 0.05)",
     "trend":        "Data has a visible trend (non-stationary)",
     "seasonality":  "Repeating seasonal pattern detected",
     "pacf_cutoff":  "PACF cuts off sharply → AR signature",
     "acf_cutoff":   "ACF cuts off sharply  → MA signature",
     "both_decay":   "Both ACF & PACF decay gradually → mixed AR+MA",
+}
+
+# ─── Model equations for display ───────────────────────────────────────────
+MODEL_EQUATIONS = {
+    "AR":     "y(t) = c + φ₁·y(t-1) + … + φₚ·y(t-p) + ε(t)",
+    "MA":     "y(t) = μ + ε(t) + θ₁·ε(t-1) + … + θ_q·ε(t-q)",
+    "ARMA":   "y(t) = c + Σφᵢ·y(t-i) + Σθⱼ·ε(t-j) + ε(t)",
+    "ARIMA":  "Δᵈy(t) = c + Σφᵢ·Δᵈy(t-i) + Σθⱼ·ε(t-j) + ε(t)",
+    "SARIMA": "ARIMA(p,d,q)×(P,D,Q)[s]  with seasonal differencing",
 }
 
 
@@ -127,14 +138,113 @@ def generate_random_ts(n_points: int = 200,
 # ═══════════════════════════════════════════════════════════════════════════
 #  HELPER :  Analyse ACF / PACF and recommend a model
 # ═══════════════════════════════════════════════════════════════════════════
+def _detect_cutoff(vals: np.ndarray, threshold: float, max_lags: int):
+    """
+    Detect whether a correlogram (ACF or PACF) "cuts off" cleanly.
+
+    A true cutoff means:
+      • The first few lags (up to some order p or q) are significant
+      • The remaining lags are mostly within the confidence band
+
+    Returns (is_cutoff: bool, order: int)
+    """
+    sig = np.abs(vals[1:]) > threshold  # boolean mask, True = significant
+    n = len(sig)
+    if n == 0 or not sig.any():
+        return False, 0
+
+    # Find the first lag that is NOT significant → candidate cutoff point
+    # We require at least 1 significant early lag.
+    first_nonsig = np.argmin(sig)  # first False in the mask
+    if first_nonsig == 0:
+        # Even lag-1 is not significant → no cutoff pattern
+        return False, 0
+
+    order = first_nonsig  # number of significant lags before the cutoff
+
+    # After the cutoff, at least 60 % of remaining lags should be
+    # inside the band for it to count as a "clean" cutoff
+    remaining = sig[order:]
+    if len(remaining) == 0:
+        return True, order
+    fraction_inside = 1 - remaining.mean()  # fraction within the band
+    is_cutoff = fraction_inside >= 0.60
+    return is_cutoff, order
+
+
+def _detect_gradual_decay(vals: np.ndarray, threshold: float):
+    """
+    Detect whether a correlogram decays gradually rather than cutting off.
+
+    Gradual decay means:
+      • Many lags are significant
+      • The absolute values decrease over time (not sudden drop)
+
+    Returns True if decay pattern is detected.
+    """
+    abs_vals = np.abs(vals[1:])  # skip lag-0
+    n = len(abs_vals)
+    if n < 6:
+        return False
+
+    sig = abs_vals > threshold
+    fraction_significant = sig.mean()
+
+    # "Gradual" = more than 40 % of lags are significant …
+    if fraction_significant < 0.40:
+        return False
+
+    # … AND the values are trending downward (negative slope)
+    x = np.arange(n)
+    slope = np.polyfit(x, abs_vals, 1)[0]
+    return slope < 0  # decreasing absolute correlation = decay
+
+
+def _detect_seasonality_from_acf(acf_vals: np.ndarray, threshold: float,
+                                  season_period: int):
+    """
+    Look for recurring spikes in the ACF at multiples of `season_period`.
+
+    Returns (detected: bool, detected_period: int or None)
+    """
+    # Check lags at 1×, 2×, and 3× the candidate season period
+    multiples = [season_period * k for k in range(1, 4)]
+    hits = 0
+    for lag in multiples:
+        if lag < len(acf_vals) and abs(acf_vals[lag]) > threshold:
+            hits += 1
+
+    # Also scan for ANY repeating peak if the user-supplied period didn't hit
+    auto_period = None
+    if hits == 0:
+        # Scan lags 2..len/2 for the first significant spike after an
+        # initial decay, which could indicate a seasonal cycle.
+        for lag in range(2, len(acf_vals)):
+            if abs(acf_vals[lag]) > threshold * 1.5:
+                # Verify a second spike at 2× this lag
+                double = lag * 2
+                if double < len(acf_vals) and abs(acf_vals[double]) > threshold:
+                    auto_period = lag
+                    hits = 2
+                    break
+
+    detected = hits >= 1
+    period = auto_period if auto_period else (season_period if detected else None)
+    return detected, period
+
+
 def analyse_acf_pacf(series: pd.Series,
                      nlags: int = 40,
                      has_trend: bool = False,
                      has_season: bool = False,
                      season_period: int = 12):
     """
-    Compute ACF and PACF, then apply simple rule-based heuristics to decide
-    which model is most appropriate.
+    Full diagnostic pipeline:
+      1. ADF stationarity test
+      2. Compute ACF and PACF
+      3. Detect traits from plot shapes (cutoff, decay, seasonality)
+      4. Score each model
+      5. Build a rich human-readable summary with equations
 
     Returns
     -------
@@ -145,61 +255,63 @@ def analyse_acf_pacf(series: pd.Series,
     summary    : str        – multi-line English explanation
     scores     : dict       – {model_name: float} confidence-like ranking (0-1)
     """
-    # Ensure nlags doesn't exceed half the series length (statsmodels rule)
+
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  Step 1 :  ADF Stationarity Test                                   │
+    # │  This is the REAL way to detect trend / non-stationarity.          │
+    # │  If p-value > 0.05 → we cannot reject the null hypothesis that     │
+    # │  a unit root exists → series is NON-stationary.                    │
+    # └─────────────────────────────────────────────────────────────────────┘
+    adf_result = adfuller(series, autolag="AIC")
+    adf_pvalue = round(adf_result[1], 4)
+    is_nonstationary = adf_pvalue > 0.05  # True = non-stationary
+
+    # Trend detection: use ADF result as primary signal,
+    # but also honour the user toggle (for synthetic data)
+    trend_detected = is_nonstationary or has_trend
+
+    # Suggested differencing order
+    d_order = 1 if is_nonstationary else 0
+
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  Step 2 :  Compute ACF and PACF                                    │
+    # └─────────────────────────────────────────────────────────────────────┘
     max_lags = min(nlags, len(series) // 2 - 1)
     if max_lags < 5:
         max_lags = 5
 
-    # --- Compute ACF and PACF ---
     acf_vals  = acf(series, nlags=max_lags, fft=True)
     pacf_vals = pacf(series, nlags=max_lags, method="ywm")
 
-    # --- Significance threshold (approximate 95 % confidence) ---
+    # 95 % confidence threshold
     threshold = 1.96 / np.sqrt(len(series))
 
     # ┌─────────────────────────────────────────────────────────────────────┐
-    # │  Detect traits from ACF / PACF shapes                              │
+    # │  Step 3 :  Detect traits from ACF / PACF shapes                    │
     # └─────────────────────────────────────────────────────────────────────┘
 
-    # -- PACF cutoff: significant for first p lags, then drops within band --
-    sig_pacf = np.where(np.abs(pacf_vals[1:]) > threshold)[0]  # indices of significant lags
-    pacf_cutoff = False
-    pacf_order = 0
-    if len(sig_pacf) > 0:
-        # check if significant lags are clustered at the start
-        first_gap = np.diff(sig_pacf)
-        if len(first_gap) == 0 or (sig_pacf[0] < 3 and len(sig_pacf) <= max_lags // 3):
-            pacf_cutoff = True
-            pacf_order = sig_pacf[-1] + 1 if len(sig_pacf) <= 5 else sig_pacf[0] + 1
+    # -- 3a. PACF cutoff → AR signature --
+    pacf_cutoff, p_order = _detect_cutoff(pacf_vals, threshold, max_lags)
 
-    # -- ACF cutoff: significant for first q lags, then drops within band --
-    sig_acf = np.where(np.abs(acf_vals[1:]) > threshold)[0]
-    acf_cutoff = False
-    acf_order = 0
-    if len(sig_acf) > 0:
-        if len(sig_acf) <= max_lags // 3:
-            acf_cutoff = True
-            acf_order = sig_acf[-1] + 1 if len(sig_acf) <= 5 else sig_acf[0] + 1
+    # -- 3b. ACF cutoff → MA signature --
+    acf_cutoff, q_order = _detect_cutoff(acf_vals, threshold, max_lags)
 
-    # -- Both decay: many significant lags in BOTH ACF and PACF --
-    both_decay = (len(sig_acf) > max_lags // 3) and (len(sig_pacf) > max_lags // 3)
+    # -- 3c. Gradual decay in both → ARMA signature --
+    acf_decays  = _detect_gradual_decay(acf_vals, threshold)
+    pacf_decays = _detect_gradual_decay(pacf_vals, threshold)
+    both_decay  = acf_decays and pacf_decays
 
-    # -- Seasonality: spikes in ACF at multiples of season_period --
-    seasonality_detected = False
-    if has_season and max_lags >= season_period * 2:
-        seasonal_lags = [season_period, season_period * 2]
-        hits = sum(1 for sl in seasonal_lags
-                   if sl < len(acf_vals) and abs(acf_vals[sl]) > threshold * 2)
-        seasonality_detected = hits >= 1
-    # Also flag seasonality if the user explicitly toggled it on
+    # -- 3d. Seasonality detection (auto from ACF peaks + user hint) --
+    seasonality_detected, detected_period = _detect_seasonality_from_acf(
+        acf_vals, threshold, season_period)
+    # Also honour the user toggle as a hint
     if has_season:
         seasonality_detected = True
-
-    # Trend detection is based on the user toggle (since we generated the data)
-    trend_detected = has_trend
+        detected_period = detected_period or season_period
 
     # ─── Build the reasons dict ──────────────────────────────────────────
     reasons = {
+        "stationarity": is_nonstationary,
         "trend":        trend_detected,
         "seasonality":  seasonality_detected,
         "pacf_cutoff":  pacf_cutoff,
@@ -208,95 +320,176 @@ def analyse_acf_pacf(series: pd.Series,
     }
 
     # ┌─────────────────────────────────────────────────────────────────────┐
-    # │  Score each model (higher = more appropriate)                      │
+    # │  Step 4 :  Score each model                                        │
+    # │  Weights are heuristic but follow the textbook decision tree:      │
+    # │    Stationary?  →  ACF/PACF shape  →  AR / MA / ARMA               │
+    # │    Non-stationary?  →  ARIMA   (+ seasonal? → SARIMA)              │
     # └─────────────────────────────────────────────────────────────────────┘
     scores = {m: 0.0 for m in MODEL_NAMES}
 
-    # AR  – favoured when PACF cuts off, no trend, no season
+    # AR – PACF cuts off, ACF decays, data is stationary
     if pacf_cutoff and not acf_cutoff:
-        scores["AR"] += 0.6
+        scores["AR"] += 0.55
+    if pacf_cutoff and acf_decays:
+        scores["AR"] += 0.15
     if not trend_detected:
         scores["AR"] += 0.15
     if not seasonality_detected:
-        scores["AR"] += 0.1
+        scores["AR"] += 0.05
 
-    # MA  – favoured when ACF cuts off, no trend, no season
+    # MA – ACF cuts off, PACF decays, data is stationary
     if acf_cutoff and not pacf_cutoff:
-        scores["MA"] += 0.6
+        scores["MA"] += 0.55
+    if acf_cutoff and pacf_decays:
+        scores["MA"] += 0.15
     if not trend_detected:
         scores["MA"] += 0.15
     if not seasonality_detected:
-        scores["MA"] += 0.1
+        scores["MA"] += 0.05
 
-    # ARMA – favoured when both decay, no trend, no season
+    # ARMA – both ACF and PACF decay gradually, data is stationary
     if both_decay:
         scores["ARMA"] += 0.55
-    if pacf_cutoff and acf_cutoff:
-        scores["ARMA"] += 0.35
+    if acf_decays and pacf_cutoff:
+        scores["ARMA"] += 0.10
+    if pacf_decays and acf_cutoff:
+        scores["ARMA"] += 0.10
     if not trend_detected:
-        scores["ARMA"] += 0.1
+        scores["ARMA"] += 0.10
     if not seasonality_detected:
         scores["ARMA"] += 0.05
 
-    # ARIMA – favoured when trend present (needs differencing)
+    # ARIMA – series is non-stationary (ADF test), needs differencing
+    if is_nonstationary:
+        scores["ARIMA"] += 0.50
     if trend_detected:
-        scores["ARIMA"] += 0.55
-    if both_decay and trend_detected:
         scores["ARIMA"] += 0.15
-    if pacf_cutoff and trend_detected:
-        scores["ARIMA"] += 0.1
+    if is_nonstationary and pacf_cutoff:
+        scores["ARIMA"] += 0.10
+    if is_nonstationary and both_decay:
+        scores["ARIMA"] += 0.10
     if not seasonality_detected:
         scores["ARIMA"] += 0.05
 
-    # SARIMA – favoured when seasonality present
+    # SARIMA – seasonality present (with or without trend)
     if seasonality_detected:
-        scores["SARIMA"] += 0.55
-    if trend_detected and seasonality_detected:
-        scores["SARIMA"] += 0.2
-    if both_decay and seasonality_detected:
-        scores["SARIMA"] += 0.1
+        scores["SARIMA"] += 0.50
+    if seasonality_detected and trend_detected:
+        scores["SARIMA"] += 0.20
+    if seasonality_detected and is_nonstationary:
+        scores["SARIMA"] += 0.10
+    if seasonality_detected and both_decay:
+        scores["SARIMA"] += 0.05
 
-    # Normalise scores to [0, 1]
+    # Normalise to [0, 1]
     max_score = max(scores.values()) if max(scores.values()) > 0 else 1
     scores = {m: round(s / max_score, 2) for m, s in scores.items()}
 
     # ─── Pick the best model ────────────────────────────────────────────
     best_model = max(scores, key=scores.get)
 
-    # ─── Build a human-readable summary ─────────────────────────────────
-    lines = []
-    lines.append(f"✦ RECOMMENDED MODEL : {best_model}")
-    lines.append("─" * 50)
+    # ─── Build suggested order string (e.g. "ARIMA(2,1,0)") ─────────────
+    p = p_order if pacf_cutoff else (1 if pacf_decays else 0)
+    q = q_order if acf_cutoff  else (1 if acf_decays  else 0)
+    d = d_order
+    s = detected_period or season_period
 
-    if trend_detected:
-        lines.append("• Trend detected → the data is non-stationary.")
-        lines.append("  Differencing is needed before modelling.")
-    else:
-        lines.append("• No strong trend → the data appears stationary.")
+    order_str = {
+        "AR":     f"AR({p})",
+        "MA":     f"MA({q})",
+        "ARMA":   f"ARMA({p},{q})",
+        "ARIMA":  f"ARIMA({p},{d},{q})",
+        "SARIMA": f"SARIMA({p},{d},{q})({1},{1 if is_nonstationary else 0},{1})[{s}]",
+    }
 
-    if seasonality_detected:
-        lines.append(f"• Seasonal pattern found (period ≈ {season_period}).")
-        lines.append("  A seasonal model component is appropriate.")
-    else:
-        lines.append("• No clear seasonality detected.")
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  Step 5 :  Build 3 separate text panels for side-by-side display   │
+    # └─────────────────────────────────────────────────────────────────────┘
 
-    if pacf_cutoff:
-        lines.append(f"• PACF cuts off after lag {pacf_order}"
-                     f" → autoregressive (AR) behaviour.")
+    # ── Panel 1 : ADF Test + Pattern Analysis ────────────────────────────
+    p1 = []
+    stationarity_word = "Non-stationary" if is_nonstationary else "Stationary"
+    p1.append("═══ Stationarity Test ═══")
+    p1.append(f"")
+    p1.append(f"ADF p-value : {adf_pvalue}")
+    p1.append(f"Result      : {stationarity_word}")
+    if is_nonstationary:
+        p1.append(f"  → Differencing needed (d={d_order})")
+    p1.append("")
+    p1.append("═══ Pattern Analysis ═══")
+    p1.append("")
     if acf_cutoff:
-        lines.append(f"• ACF cuts off after lag {acf_order}"
-                     f" → moving-average (MA) behaviour.")
-    if both_decay:
-        lines.append("• Both ACF and PACF decay slowly"
-                     " → mixed ARMA behaviour likely.")
+        p1.append(f"ACF    : Cuts off at lag {q_order}")
+        p1.append(f"         → q = {q_order}")
+    elif acf_decays:
+        p1.append(f"ACF    : Gradual decay")
+    else:
+        p1.append(f"ACF    : No strong pattern")
+    p1.append("")
+    if pacf_cutoff:
+        p1.append(f"PACF   : Cuts off at lag {p_order}")
+        p1.append(f"         → p = {p_order}")
+    elif pacf_decays:
+        p1.append(f"PACF   : Gradual decay")
+    else:
+        p1.append(f"PACF   : No strong pattern")
+    p1.append("")
+    if trend_detected:
+        p1.append("Trend  : ● Detected")
+    else:
+        p1.append("Trend  : ○ Not detected")
+    if seasonality_detected:
+        p1.append(f"Season : ● Period ≈ {detected_period or season_period}")
+    else:
+        p1.append("Season : ○ Not detected")
 
-    lines.append("─" * 50)
-    lines.append("Model confidence scores:")
+    # ── Panel 2 : Recommendation + Equation ──────────────────────────────
+    p2 = []
+    p2.append(f"✦  {order_str[best_model]}")
+    p2.append("")
+    p2.append("Equation:")
+    p2.append(f"  {MODEL_EQUATIONS[best_model]}")
+    p2.append("")
+    p2.append("Why this model?")
+    # Add short plain-English reason
+    if best_model == "AR":
+        p2.append("  PACF cuts off → past values")
+        p2.append("  directly influence the future.")
+        p2.append("  Data is stationary, no need")
+        p2.append("  for differencing.")
+    elif best_model == "MA":
+        p2.append("  ACF cuts off → shocks persist")
+        p2.append(f"  for {q} period(s) then fade.")
+        p2.append("  Data is stationary.")
+    elif best_model == "ARMA":
+        p2.append("  Both ACF and PACF decay")
+        p2.append("  gradually → mixed auto-")
+        p2.append("  regressive + moving-average.")
+    elif best_model == "ARIMA":
+        p2.append("  ADF test shows non-stationary")
+        p2.append(f"  data → differencing (d={d}) is")
+        p2.append("  needed before fitting AR/MA.")
+    elif best_model == "SARIMA":
+        p2.append("  Seasonal pattern detected in")
+        p2.append(f"  ACF at period ≈ {detected_period or season_period}.")
+        p2.append("  A seasonal component is needed")
+        p2.append("  on top of ARIMA.")
+
+    # ── Panel 3 : Confidence Scores ──────────────────────────────────────
+    p3 = []
     for m in MODEL_NAMES:
-        bar = "█" * int(scores[m] * 20)
-        lines.append(f"  {m:8s}  {bar:20s}  {scores[m]:.2f}")
+        pct = int(scores[m] * 100)
+        bar = "█" * int(scores[m] * 15)
+        empty = "░" * (15 - int(scores[m] * 15))
+        p3.append(f"  {order_str[m]}")
+        p3.append(f"  {bar}{empty}  {pct:3d}%")
+        p3.append("")
 
-    summary = "\n".join(lines)
+    summary = {
+        "diagnostics": "\n".join(p1),
+        "recommendation": "\n".join(p2),
+        "scores": "\n".join(p3),
+    }
 
     return acf_vals, pacf_vals, best_model, reasons, summary, scores
 
@@ -656,14 +849,46 @@ class TimeSeriesAnalyzerApp:
 
             self.reason_labels_widgets[key] = (indicator, lbl)
 
-        # ── Summary text box ────────────────────────────────────────────
-        self.txt_summary = scrolledtext.ScrolledText(
-            outer, height=18, wrap="word",
+        # ── Three side-by-side summary panels ────────────────────────────
+        # Instead of one big scrolled text, we use 3 compact panels:
+        #   Left   = ADF test + pattern analysis
+        #   Middle = recommended model + equation + why
+        #   Right  = confidence scores for all models
+        summary_frame = tk.Frame(outer, bg=BG_COLOR)
+        summary_frame.pack(fill="x", pady=(8, 12))
+
+        panel_cfg = dict(
             bg="#1a1a2e", fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
-            font=("Consolas", 10), relief="flat", bd=0,
-            state="disabled"  # read-only until analysis fills it
+            font=("Consolas", 8), relief="flat", bd=0,
+            state="disabled", wrap="word", height=20,
         )
-        self.txt_summary.pack(fill="x", pady=(8, 12))
+
+        # Panel 1 – Diagnostics
+        f1 = tk.Frame(summary_frame, bg=PANEL_BG, bd=1,
+                      highlightbackground=CARD_BORDER, highlightthickness=1)
+        f1.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        tk.Label(f1, text="Diagnostics", bg=PANEL_BG, fg=ACCENT_LIGHT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        self.txt_diagnostics = tk.Text(f1, **panel_cfg)
+        self.txt_diagnostics.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Panel 2 – Recommendation
+        f2 = tk.Frame(summary_frame, bg=PANEL_BG, bd=1,
+                      highlightbackground=CARD_BORDER, highlightthickness=1)
+        f2.pack(side="left", fill="both", expand=True, padx=4)
+        tk.Label(f2, text="Recommendation", bg=PANEL_BG, fg=ACCENT_LIGHT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        self.txt_recommendation = tk.Text(f2, **panel_cfg)
+        self.txt_recommendation.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Panel 3 – Confidence Scores
+        f3 = tk.Frame(summary_frame, bg=PANEL_BG, bd=1,
+                      highlightbackground=CARD_BORDER, highlightthickness=1)
+        f3.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        tk.Label(f3, text="Confidence Scores", bg=PANEL_BG, fg=ACCENT_LIGHT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        self.txt_scores = tk.Text(f3, **panel_cfg)
+        self.txt_scores.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
     # ===================================================================
     #  EVENT HANDLER :  Generate button clicked
@@ -869,11 +1094,16 @@ class TimeSeriesAnalyzerApp:
                 lbl.configure(fg=DISABLED_FG)
                 self.reason_vars[key].set(0)
 
-        # ── 3c. Update summary text ─────────────────────────────────────
-        self.txt_summary.configure(state="normal")
-        self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", summary)
-        self.txt_summary.configure(state="disabled")
+        # ── 3c. Update the three summary panels ─────────────────────────
+        for widget, key in [
+            (self.txt_diagnostics,    "diagnostics"),
+            (self.txt_recommendation, "recommendation"),
+            (self.txt_scores,         "scores"),
+        ]:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", summary[key])
+            widget.configure(state="disabled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
